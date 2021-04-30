@@ -29,8 +29,8 @@ import numpy as np
 import imagecodecs
 from PIL import Image
 from matplotlib import colors
-from openslide import OpenSlide
-from openslide.deepzoom import DeepZoomGenerator
+#from openslide import OpenSlide
+#from openslide.deepzoom import DeepZoomGenerator
 from threading import Timer
 from flask import Flask
 from flask import jsonify
@@ -162,15 +162,7 @@ class Opener:
             print("RGB type ", self.rgba_type)
 
         elif self.ext == '.svs':
-            self.io = OpenSlide(self.path)
-            self.dz = DeepZoomGenerator(self.io, tile_size=1024, overlap=0, limit_bounds=True)
-            self.reader = 'openslide'
-            self.rgba = True
-            self.rgba_type = None
-            self.default_dtype = np.uint8
-
-            print("RGB ", self.rgba)
-            print("RGB type ", self.rgba_type)
+            raise Exception("SVS not supported on O2")
 
         else:
             self.reader = None
@@ -226,8 +218,7 @@ class Opener:
             nx = int(np.ceil(self.group[level].shape[-1] / tile_size))
             return (nx, ny)
         elif self.reader == 'openslide':
-            l = self.dz.level_count - 1 - level
-            return self.dz.level_tiles[l]
+            raise Exception("SVS not supported on O2")
 
     def get_shape(self):
         def parse_shape(shape):
@@ -247,16 +238,7 @@ class Opener:
             return (num_channels, num_levels, shape_x, shape_y)
 
         elif self.reader == 'openslide':
-
-            (width, height) = self.io.dimensions
-
-            def has_one_tile(counts):
-                return max(counts) == 1
-
-            small_levels = list(filter(has_one_tile, self.dz.level_tiles))
-            level_count = self.dz.level_count - len(small_levels) + 1
-
-            return (3, level_count, width, height)
+            raise Exception("SVS not supported on O2")
 
     def read_tiles(self, level, channel_number, tx, ty, tilesize):
         ix = tx * tilesize
@@ -315,9 +297,7 @@ class Opener:
             return Image.fromarray(tile, _format)
 
         elif self.reader == 'openslide':
-            l = self.dz.level_count - 1 - level
-            img = self.dz.get_tile(l, (tx, ty))
-            return img
+            raise Exception("SVS not supported on O2")
 
     def save_mask_tiles(self, filename, mask_params, logger, tile_size, level, tx, ty):
 
@@ -428,9 +408,7 @@ class Opener:
                 img.save(output_file, quality=85)
 
         elif self.reader == 'openslide':
-            l = self.dz.level_count - 1 - level
-            img = self.dz.get_tile(l, (tx, ty))
-            img.save(output_file, quality=85)
+            raise Exception("SVS not supported on O2")
 
 def api_error(status, message):
     return jsonify({
