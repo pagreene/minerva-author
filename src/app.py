@@ -17,11 +17,15 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from distutils import file_util
 from distutils.errors import DistutilsFileError
+from enum import Enum
 from functools import update_wrapper, wraps
 from pathlib import Path
 from threading import Timer
+from typing import Callable, List, Optional
 
 # Needed for pyinstaller
+from urllib.parse import unquote
+
 from imagecodecs import _imcd, _jpeg2k, _jpeg8, _zlib  # noqa
 from numcodecs import blosc, compat_ext  # noqa
 
@@ -40,10 +44,13 @@ from openslide.deepzoom import DeepZoomGenerator
 
 # Web App tools
 import webbrowser
-from waitress import serve
-from urllib.parse import unquote
-from flask import Flask, jsonify, make_response, request, send_file
-from flask_cors import CORS, cross_origin
+import uvicorn
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 # Local sub-modules
 from pyramid_assemble import main as make_ome
@@ -67,7 +74,8 @@ if os.name == "nt":
 
 PORT = 2020
 
-FORMATTER = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("minerva-author-app")
 
 
 def check_ext(path):
@@ -143,6 +151,8 @@ def get_empty_path(path):
 
 
 class ZarrWrapper:
+    """An abstraction of Zarr that does not require indices be in a specific order."""
+
     def __init__(self, group, dimensions):
 
         self.group = group
@@ -514,13 +524,19 @@ class Opener:
         img.save(output_file, quality=85)
 
 
-def api_error(status, message):
-    return jsonify({"error": message}), status
+class BasicResponse(BaseModel):
+    message: str
+
+
+class HTTPFileNotFoundException(HTTPException):
+    def __init__(self, filename):
+        super(HTTPFileNotFoundException, self).__init__(
+            status_code=404, detail=f"File not found: {filename}."
+        )
 
 
 def reset_globals():
     _g = {
-        "logger": logging.getLogger("app"),
         "import_pool": ThreadPoolExecutor(max_workers=1),
         "preview_cache": {},
         "image_openers": {},
@@ -528,11 +544,6 @@ def reset_globals():
         "save_progress": {},
         "save_progress_max": {},
     }
-    _g["logger"].setLevel(logging.INFO)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(FORMATTER)
-    _g["logger"].addHandler(ch)
     return _g
 
 
@@ -550,10 +561,25 @@ def resource_path(relative_path):
 G = reset_globals()
 tiff_lock = multiprocessing.Lock()
 mask_lock = multiprocessing.Lock()
-app = Flask(__name__, static_folder=resource_path("static"), static_url_path="")
+app = FastAPI(title="Minerva Author")
+app.mount("/static", StaticFiles(directory=resource_path("static")), name="static")
 
-cors = CORS(app)
-app.config["CORS_HEADERS"] = "Content-Type"
+templates = Jinja2Templates(directory="templates")
+
+# Source: https://fastapi.tiangolo.com/tutorial/cors/
+if "MINERVA_AUTHOR_CORS_ORIGINS" in os.environ:
+    cors_origins = os.environ["MINERVA_AUTHOR_CORS_ORIGINS"].split(":")
+else:
+    cors_origins = ["http://localhost*", "https://localhost*"]
+
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def cache_opener(path, opener, key, multi_lock):
@@ -587,8 +613,6 @@ def return_opener(path, key):
 
 
 def convert_mask(path):
-    sys.stdout.reconfigure(line_buffering=True)
-
     ome_path = tif_path_to_ome_path(path)
     if os.path.exists(ome_path):
         return
@@ -664,10 +688,10 @@ def return_image_opener(path):
     return (not success, opener)
 
 
-def nocache(view):
+def nocache(view: Callable):
     @wraps(view)
     def no_cache(*args, **kwargs):
-        response = make_response(view(*args, **kwargs))
+        response = view(*args, **kwargs)
         response.headers["Last-Modified"] = datetime.now()
         response.headers[
             "Cache-Control"
@@ -774,45 +798,33 @@ def reload_all_mask_state_subsets(masks):
     return masks
 
 
-@app.route("/")
+@app.get("/", response_model=HTMLResponse)
 @nocache
 def root():
     """
     Serves the minerva-author web UI
     """
-    return app.send_static_file("index.html")
+    return templates.TemplateResponse("index.html", {})
 
 
-@app.route("/story/<session>/", defaults={"path": "index.html"})
-@app.route("/story/<session>/<path:path>")
-@cross_origin()
+@app.get("/story/{session}/{file_path:path}", response_model=FileResponse)
 @nocache
-def out_story(session, path):
+def out_story(session: str, file_path: str):
     """
     Serves any file path in the given story preview
     Args:
         session: unique string identifying save output
-        path: any file path in story preview
+        file_path: any file path in story preview
     Returns: content of any given file
     """
     cache_dict = G["preview_cache"].get(session, {})
-    path_cache = cache_dict.get(path, None)
-
-    not_found = """
-    <html>
-        <head>
-        </head>
-        <body>
-            Please restart Minerva Author and
-            <a href="/">return here</a> to reload your save file.
-        </body>
-    </html>
-    """
+    path_cache = cache_dict.get(file_path, None)
 
     if path_cache is None:
-        response = make_response(not_found, 404)
-        response.mimetype = "text/html"
-        return response
+        raise HTTPException(
+            status_code=404,
+            detail="Cache not found: Please restart Minerva Author to reload your save file.",
+        )
 
     args = path_cache.get("args", [])
     kwargs = path_cache.get("kwargs", {})
@@ -820,20 +832,21 @@ def out_story(session, path):
     function = path_cache.get("function", lambda: None)
     out_file = function(*args, **kwargs)
 
-    try:
-        if mimetype:
-            return send_file(out_file, mimetype=mimetype)
-        else:
-            return send_file(out_file)
-    except Exception:
-        message = f"Unable to preview {session}/{path}"
-        return api_error(500, message)
+    if mimetype:
+        return FileResponse(out_file, media_type=mimetype)
+    else:
+        return FileResponse(out_file)
 
 
-@app.route("/api/validate/u32/<key>")
-@cross_origin()
+class Validation(BaseModel):
+    invalid: bool
+    ready: bool
+    path: str
+
+
+@app.get("/api/validate/u32/{key}", response_model=Validation)
 @nocache
-def u32_validate(key):
+def u32_validate(key: str):
     """
     Returns status for given image mask
     Args:
@@ -849,19 +862,22 @@ def u32_validate(key):
     # Open the input file on the first request only
     (invalid, opener) = return_mask_opener(path, convert=True)
 
-    return jsonify(
-        {
-            "invalid": invalid,
-            "ready": True if isinstance(opener, Opener) else False,
-            "path": opener.path if isinstance(opener, Opener) else "",
-        }
-    )
+    return {
+        "invalid": invalid,
+        "ready": True if isinstance(opener, Opener) else False,
+        "path": opener.path if isinstance(opener, Opener) else "",
+    }
 
 
-@app.route("/api/mask_subsets/<key>")
-@cross_origin()
+class MaskSubsets(BaseModel):
+    mask_states: List[str]
+    mask_subsets: List[list]
+    subset_colors: List[List[int]]
+
+
+@app.get("/api/mask_subsets/{key}", response_model=MaskSubsets)
 @nocache
-def mask_subsets(key):
+def mask_subsets(key: str):
     """
     Returns the dictionary of mask subsets
     Args:
@@ -873,15 +889,11 @@ def mask_subsets(key):
     path = unquote(key)
 
     if not os.path.exists(path):
-        response = make_response("Not found", 404)
-        response.mimetype = "text/plain"
-        return response
+        raise HTTPFileNotFoundException(path)
 
     mask_state_subsets = load_mask_state_subsets(path)
     if mask_state_subsets is None:
-        response = make_response("Not found", 404)
-        response.mimetype = "text/plain"
-        return response
+        raise HTTPException(status_code=404, detail=f'No mask states found at "{path}"')
 
     mask_states = []
     mask_subsets = []
@@ -890,19 +902,16 @@ def mask_subsets(key):
             mask_states.append(mask_state)
             mask_subsets.append([k, v])
 
-    return jsonify(
-        {
-            "mask_states": mask_states,
-            "mask_subsets": mask_subsets,
-            "subset_colors": [colorize_integer(v[0]) for [k, v] in mask_subsets],
-        }
-    )
+    return {
+        "mask_states": mask_states,
+        "mask_subsets": mask_subsets,
+        "subset_colors": [colorize_integer(v[0]) for _, v in mask_subsets],
+    }
 
 
-@app.route("/api/u32/<key>/<level>_<x>_<y>.png")
-@cross_origin()
+@app.get("/api/u32/{key}/{level}_{x}_{y}.png", response_model=StreamingResponse)
 @nocache
-def u32_image(key, level, x, y):
+def u32_image(key: str, level: int, x: int, y: int):
     """
     Returns a 32-bit tile from given image mask
     Args:
@@ -921,20 +930,19 @@ def u32_image(key, level, x, y):
     (invalid, opener) = return_mask_opener(path, convert=False)
 
     if isinstance(opener, Opener):
-        img_io = render_tile(opener, int(level), int(x), int(y), 0, "RGBA")
+        img_io = render_tile(opener, level, x, y, 0, "RGBA")
 
     if img_io is None:
-        response = make_response("Not found", 404)
-        response.mimetype = "text/plain"
-        return response
+        raise HTTPFileNotFoundException(f"{key=}, {level=}, {x=}, {y=}.")
 
-    return send_file(img_io, mimetype="image/png")
+    return StreamingResponse(img_io, media_type="image/png")
 
 
-@app.route("/api/u16/<key>/<channel>/<level>_<x>_<y>.png")
-@cross_origin()
+@app.get(
+    "/api/u16/{key}/{channel}/{level}_{x}_{y}.png", response_model=StreamingResponse
+)
 @nocache
-def u16_image(key, channel, level, x, y):
+def u16_image(key: str, channel: int, level: int, x: int, y: int):
     """
     Returns a single channel 16-bit tile from the image
     Args:
@@ -957,11 +965,9 @@ def u16_image(key, channel, level, x, y):
         img_io = render_tile(opener, int(level), int(x), int(y), int(channel))
 
     if img_io is None:
-        response = make_response("Not found", 404)
-        response.mimetype = "text/plain"
-        return response
+        raise HTTPFileNotFoundException(f"{key=}, {channel=}, {level=}, {x=}, {y=}")
 
-    return send_file(img_io, mimetype="image/png")
+    return StreamingResponse(img_io, media_type="image/png")
 
 
 def make_saved_chan(chan):
@@ -981,52 +987,68 @@ def make_saved_file(data):
     return new_copy
 
 
-@app.route("/api/save/<session>", methods=["POST"])
-@cross_origin()
+class SampleInfo(BaseModel):
+    rotation: int
+    name: str
+    text: str
+
+
+class SessionData(BaseModel):
+    is_autosave: bool
+    waypoints: list
+    groups: list
+    masks: list
+    sample_info: SampleInfo
+    csv_file: str
+    in_file: str
+    root_dir: str
+    out_name: str
+
+
+@app.post("/api/save/{session}", response_model=BasicResponse)
 @nocache
-def api_save(session):
+def api_save(session: str, session_data: SessionData):
     """
     Saves minerva-author project information in json file.
     Args:
         session: unique string identifying save output
+        session_data: the session data given us by the server.
     Returns: OK on success
 
     """
-    if request.method == "POST":
-        data = request.json
-        data = make_saved_file(data)
+    data = make_saved_file(session_data.dict())
 
-        root_dir = data["root_dir"]
-        out_name = data["out_name"]
+    root_dir = data["root_dir"]
+    out_name = data["out_name"]
 
-        if not os.path.exists(root_dir):
-            os.makedirs(root_dir)
+    if not os.path.exists(root_dir):
+        os.makedirs(root_dir)
 
-        out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
+    out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
 
-        saved = load_saved_file(out_dat)[0]
-        # Only relegate to autosave if save file exists
-        if saved and data.get("is_autosave"):
-            # Copy new data to autosave and copy old saved to data
-            data["autosave"] = copy_saved_states(data, {})
-            data = copy_saved_states(saved, data)
-            # Set the autosave timestamp
-            data["autosave"]["timestamp"] = time.time()
-        else:
-            # Set the current timestamp
-            data["timestamp"] = time.time()
-            # Persist old autosaves just in case
-            if saved and "autosave" in saved:
-                data["autosave"] = saved["autosave"]
+    saved = load_saved_file(out_dat)[0]
+    # Only relegate to autosave if save file exists
+    if saved and data.get("is_autosave"):
+        # Copy new data to autosave and copy old saved to data
+        data["autosave"] = copy_saved_states(data, {})
+        data = copy_saved_states(saved, data)
+        # Set the autosave timestamp
+        data["autosave"]["timestamp"] = time.time()
+    else:
+        # Set the current timestamp
+        data["timestamp"] = time.time()
+        # Persist old autosaves just in case
+        if saved and "autosave" in saved:
+            data["autosave"] = saved["autosave"]
 
-        with open(out_dat, "w") as out_file:
-            json.dump(data, out_file)
+    with open(out_dat, "w") as out_file:
+        json.dump(data, out_file)
 
-        # Make a copy of the visualization csv files
-        # for use with save_exhibit_pyramid.py
-        copy_vis_csv_files(data["waypoints"], pathlib.Path(out_dat))
+    # Make a copy of the visualization csv files
+    # for use with save_exhibit_pyramid.py
+    copy_vis_csv_files(data["waypoints"], pathlib.Path(out_dat))
 
-        return "OK"
+    return {"message": "OK!"}
 
 
 def render_progress_callback(current, maximum, session, key="default"):
@@ -1044,23 +1066,24 @@ def create_progress_callback(maximum, session="default", key="default"):
     return progress_callback
 
 
-@app.route("/api/render/<session>/progress", methods=["GET"])
-@cross_origin()
+class ProgressResponse(BaseModel):
+    progress: int
+    max: int
+
+
+@app.get("/api/render/{session}/progress")
 @nocache
-def get_render_progress(session):
+def get_render_progress(session: str):
     """
     Returns progress of rendering of tiles (0-100). The progress bar in minerva-author-ui uses this endpoint.
     Args:
         session: unique string identifying save output
     Returns: JSON which contains progress and max
     """
-
-    return jsonify(
-        {
-            "progress": sum(G["save_progress"].get(session, {}).values()),
-            "max": sum(G["save_progress_max"].get(session, {}).values()),
-        }
-    )
+    return {
+        "progress": sum(G["save_progress"].get(session, {}).values()),
+        "max": sum(G["save_progress_max"].get(session, {}).values()),
+    }
 
 
 def format_arrow(a):
@@ -1334,14 +1357,22 @@ def add_mask_tiles_to_dict(cache_dict, mask_config_rows):
     return cache_dict
 
 
-@app.route("/api/preview/<session>", methods=["POST"])
-@cross_origin()
+class PreviewInput(BaseModel):
+    in_file: str
+    out_name: str
+    groups: list
+    masks: list
+    waypoints: list
+
+
+@app.post("/api/preview/{session}", response_model=BasicResponse)
 @nocache
-def api_preview(session):
+def api_preview(session: str, preview_input: PreviewInput):
     """
     Caches all preview parameters for given session
     Args:
         session: unique string identifying save output
+        preview_input: the data to be previewed.
     Returns: OK on success
 
     """
@@ -1349,114 +1380,129 @@ def api_preview(session):
 
     cache_dict = {}
 
-    if request.method == "POST":
+    path = preview_input.in_file
+    out_name = preview_input.out_name
+    (invalid, opener) = return_image_opener(path)
+    # Ensure path is relative to output directory
+    out_dir_rel = get_story_folders(out_name, "")[0]
+    out_dir_rel = pathlib.Path(*pathlib.Path(out_dir_rel).parts[1:])
 
-        path = request.json["in_file"]
-        out_name = request.json["out_name"]
-        (invalid, opener) = return_image_opener(path)
-        # Ensure path is relative to output directory
-        out_dir_rel = get_story_folders(out_name, "")[0]
-        out_dir_rel = pathlib.Path(*pathlib.Path(out_dir_rel).parts[1:])
+    if invalid or not opener:
+        raise HTTPFileNotFoundException(path)
 
-        if invalid or not opener:
-            return api_error(404, "Image file not found: " + str(path))
+    config_rows = list(make_rows(preview_input.groups))
+    mask_config_rows = list(make_mask_rows(out_dir_rel, preview_input.masks, session))
+    exhibit_config = make_exhibit_config(opener, out_name, preview_input.dict())
+    cache_dict["exhibit.json"] = {
+        "function": write_json_file,
+        "args": [exhibit_config],
+        "mimetype": "text/json",
+    }
+    index_filename = os.path.join(get_story_dir(), "index.html")
+    cache_dict["index.html"] = {"function": lambda: index_filename}
 
-        config_rows = list(make_rows(request.json["groups"]))
-        mask_config_rows = list(
-            make_mask_rows(out_dir_rel, request.json["masks"], session)
-        )
-        exhibit_config = make_exhibit_config(opener, out_name, request.json)
-        cache_dict["exhibit.json"] = {
-            "function": write_json_file,
-            "args": [exhibit_config],
-            "mimetype": "text/json",
-        }
-        index_filename = os.path.join(get_story_dir(), "index.html")
-        cache_dict["index.html"] = {"function": lambda: index_filename}
+    vis_path_dict = deduplicate_data(preview_input.waypoints, "data")
+    for in_path, out_path in vis_path_dict.items():
+        cache_dict[out_path] = {"function": lambda: in_path}
 
-        vis_path_dict = deduplicate_data(request.json["waypoints"], "data")
-        for in_path, out_path in vis_path_dict.items():
-            cache_dict[out_path] = {"function": lambda: in_path}
+    cache_dict = add_mask_tiles_to_dict(cache_dict, mask_config_rows)
+    cache_dict = add_image_tiles_to_dict(cache_dict, config_rows, opener, out_dir_rel)
 
-        cache_dict = add_mask_tiles_to_dict(cache_dict, mask_config_rows)
-        cache_dict = add_image_tiles_to_dict(
-            cache_dict, config_rows, opener, out_dir_rel
-        )
-
-        G["preview_cache"][session] = cache_dict
-        return "OK"
+    G["preview_cache"][session] = cache_dict
+    return {"message": "OK"}
 
 
-@app.route("/api/render/<session>", methods=["POST"])
-@cross_origin()
+class ImageInfo(BaseModel):
+    description: str
+
+
+class RenderInput(BaseModel):
+    in_file: str
+    root_dir: str
+    out_name: str
+    masks: list
+    groups: list
+    waypoints: list
+    header: str
+    rotation: int
+    image: ImageInfo
+
+
+@app.post("/api/render/{session}", response_model=BasicResponse)
 @nocache
-def api_render(session):
+def api_render(session: str, render_input: RenderInput):
     """
     Renders all image tiles and saves them under new minerva-story instance.
     Args:
         session: unique string identifying save output
+        render_input: the data given to render the image.
     Returns: OK on success
 
     """
     G["save_progress"] = {}
     G["save_progress_max"] = {}
 
-    if request.method == "POST":
+    path = render_input.in_file
+    root_dir = render_input.root_dir
+    out_name = render_input.out_name
 
-        path = request.json["in_file"]
-        root_dir = request.json["root_dir"]
-        out_name = request.json["out_name"]
+    (invalid, opener) = return_image_opener(path)
+    out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
 
-        (invalid, opener) = return_image_opener(path)
-        out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
+    if invalid or not opener:
+        raise HTTPFileNotFoundException(path)
 
-        if invalid or not opener:
-            return api_error(404, "Image file not found: " + str(path))
+    data = render_input.groups
+    mask_data = render_input.masks
+    waypoint_data = render_input.waypoints
+    config_rows = list(make_rows(data))
+    create_story_base(out_name, waypoint_data, mask_data, folder=root_dir)
+    exhibit_config = make_exhibit_config(opener, out_name, render_input.dict())
 
-        data = request.json["groups"]
-        mask_data = request.json["masks"]
-        waypoint_data = request.json["waypoints"]
-        config_rows = list(make_rows(data))
-        create_story_base(out_name, waypoint_data, mask_data, folder=root_dir)
-        exhibit_config = make_exhibit_config(opener, out_name, request.json)
+    with open(out_yaml, "w") as wf:
+        json.dump(exhibit_config, wf)
 
-        with open(out_yaml, "w") as wf:
-            json.dump(exhibit_config, wf)
+    mask_config_rows = make_mask_rows(out_dir, mask_data, session)
 
-        mask_config_rows = make_mask_rows(out_dir, mask_data, session)
+    # Render all uint16 image channels
+    render_color_tiles(
+        opener,
+        out_dir,
+        1024,
+        config_rows,
+        logger,
+        progress_callback=create_progress_callback(0, session),
+    )
 
-        # Render all uint16 image channels
-        render_color_tiles(
-            opener,
-            out_dir,
-            1024,
-            config_rows,
-            G["logger"],
-            progress_callback=create_progress_callback(0, session),
+    # Render all uint32 segmentation masks
+    for mask_params in mask_config_rows:
+        render_u32_tiles(mask_params, 1024, logger)
+
+    return {"message": "OK"}
+
+
+class GroupPath(BaseModel):
+    filepath: str
+
+
+class Groups(BaseModel):
+    groups: dict
+
+
+@app.post("/api/import/groups", response_model=Groups)
+@nocache
+def api_import_groups(group_path: GroupPath):
+    input_file = pathlib.Path(group_path.filepath)
+    if not os.path.exists(input_file):
+        raise HTTPFileNotFoundException(input_file)
+
+    saved = load_saved_file(input_file)[0]
+    if not saved or "groups" not in saved:
+        raise HTTPException(
+            status_code=400, detail=f"File contains invalid groups: {input_file}."
         )
 
-        # Render all uint32 segmentation masks
-        for mask_params in mask_config_rows:
-            render_u32_tiles(mask_params, 1024, G["logger"])
-
-        return "OK"
-
-
-@app.route("/api/import/groups", methods=["POST"])
-@cross_origin()
-@nocache
-def api_import_groups():
-    if request.method == "POST":
-        data = request.json
-        input_file = pathlib.Path(data["filepath"])
-        if not os.path.exists(input_file):
-            return api_error(404, "File not found: " + str(input_file))
-
-        saved = load_saved_file(input_file)[0]
-        if not saved or "groups" not in saved:
-            return api_error(400, "File contains invalid groups: " + str(input_file))
-
-        return jsonify({"groups": saved["groups"]})
+    return {"groups": saved["groups"]}
 
 
 def load_saved_file(input_file):
@@ -1511,151 +1557,195 @@ def is_new_autosave(saved, autosaved):
         return False
 
 
-@app.route("/api/import", methods=["POST"])
-@cross_origin()
+class ImportResponse(BaseModel):
+    loaded: bool
+    channels: list
+    out_name: str
+    root_dir: str
+    session: str
+    output_save_file: str
+    marker_csv_file: str
+    input_image_file: str
+    waypoints: list
+    sample_info: dict
+    masks: list
+    groups: list
+    tilesize: int
+    maxLevel: int
+    height: int
+    width: int
+    warning: str
+    rgba: bool
+
+
+class AutoSaveLogic(str, Enum):
+    skip = "skip"
+    ask = "ask"
+    load = "load"
+
+
+@app.post("/api/import", response_model=ImportResponse)
 @nocache
-def api_import():
-    if request.method == "POST":
-        response = {}
-        chan_label = {}
-        data = request.form
-        default_out_name = "out"
-        input_file = pathlib.Path(data["filepath"])
-        input_image_file = pathlib.Path(data["filepath"])
-        loading_saved_file = input_file.suffix in [".dat", ".json"]
-        root_dir = get_current_dir()
+def api_import(
+    filepath: str = Form(...),
+    dataset: str = Form(...),
+    csvpath: Optional[str] = Form(...),
+    autosave_logic: Optional[str] = Form(default="skip"),
+):
+    response = {}
+    chan_label = {}
+    default_out_name = "out"
+    input_file = pathlib.Path(filepath)
+    input_image_file = pathlib.Path(filepath)
+    loading_saved_file = input_file.suffix in [".dat", ".json"]
+    root_dir = get_current_dir()
 
-        if not os.path.exists(input_file):
-            return api_error(404, "Image file not found: " + str(input_file))
+    if not os.path.exists(input_file):
+        raise HTTPFileNotFoundException(input_file)
 
-        if loading_saved_file:
-            default_out_name = extract_story_json_stem(input_file)
-            # autosave_logic should be "ask", "skip", or "load"
-            autosave_logic = data.get("autosave_logic", "skip")
-            autosave_error = autosave_logic == "ask"
+    if loading_saved_file:
+        default_out_name = extract_story_json_stem(input_file)
+        # autosave_logic should be "ask", "skip", or "load"
+        autosave_error = autosave_logic == "ask"
 
-            (saved, autosaved) = load_saved_file(input_file)
-            root_dir = os.path.dirname(input_file)
+        (saved, autosaved) = load_saved_file(input_file)
+        root_dir = os.path.dirname(input_file)
 
-            if is_new_autosave(saved, autosaved):
-                # We need to know whether to use autosave file
-                if autosave_error:
-                    action = "AUTO ASK ERR"
-                    return api_error(400, f"{action}: Autosave Error")
-                # We will load a new autosave file
-                elif autosave_logic == "load":
-                    saved = copy_saved_states(autosaved, saved)
+        if is_new_autosave(saved, autosaved):
+            # We need to know whether to use autosave file
+            if autosave_error:
+                raise HTTPException(
+                    status_code=400, detail="AUTO ASK ERR: Autosave Error."
+                )
+            # We will load a new autosave file
+            elif autosave_logic == "load":
+                saved = copy_saved_states(autosaved, saved)
 
-            input_image_file = pathlib.Path(saved["in_file"])
+        input_image_file = pathlib.Path(saved["in_file"])
 
-            if data["csvpath"]:
-                csv_file = pathlib.Path(data["csvpath"])
-                if not os.path.exists(csv_file):
-                    return api_error(404, "Marker csv file not found: " + str(csv_file))
-            else:
-                csv_file = pathlib.Path(saved["csv_file"])
-            if "sample_info" in saved:
-                response["sample_info"] = saved["sample_info"]
-                if "rotation" not in response["sample_info"]:
-                    response["sample_info"]["rotation"] = 0
-
-            if "masks" in saved:
-                # This step could take up to a minute
-                response["masks"] = reload_all_mask_state_subsets(saved["masks"])
-
-            response["waypoints"] = saved["waypoints"]
-            response["groups"] = saved["groups"]
-            for group in saved["groups"]:
-                for chan in group["channels"]:
-                    chan_label[str(chan["id"])] = chan["label"]
+        if csvpath:
+            csv_file = pathlib.Path(csvpath)
+            if not os.path.exists(csv_file):
+                raise HTTPFileNotFoundException(f'marker csv file "{csv_file}"')
         else:
-            csv_file = pathlib.Path(data["csvpath"])
+            csv_file = pathlib.Path(saved["csv_file"])
+        if "sample_info" in saved:
+            response["sample_info"] = saved["sample_info"]
+            if "rotation" not in response["sample_info"]:
+                response["sample_info"]["rotation"] = 0
 
-        out_name = label_to_dir(data["dataset"], empty=default_out_name)
-        if out_name == "":
-            out_name = default_out_name
+        if "masks" in saved:
+            # This step could take up to a minute
+            response["masks"] = reload_all_mask_state_subsets(saved["masks"])
 
-        out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
+        response["waypoints"] = saved["waypoints"]
+        response["groups"] = saved["groups"]
+        for group in saved["groups"]:
+            for chan in group["channels"]:
+                chan_label[str(chan["id"])] = chan["label"]
+    else:
+        csv_file = pathlib.Path(csvpath)
 
-        if not loading_saved_file and os.path.exists(out_dat):
+    out_name = label_to_dir(dataset, empty=default_out_name)
+    if out_name == "":
+        out_name = default_out_name
+
+    out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
+
+    if not loading_saved_file and os.path.exists(out_dat):
+        action = "OUT ASK ERR"
+        verb = "provide an" if out_name == default_out_name else "change the"
+        raise HTTPException(
+            status_code=400,
+            detail=f"{action}: Please {verb} output name, as {out_dat} exists.",
+        )
+    elif loading_saved_file and os.path.exists(out_dat):
+        if not os.path.samefile(input_file, out_dat):
             action = "OUT ASK ERR"
             verb = "provide an" if out_name == default_out_name else "change the"
-            return api_error(
-                400, f"{action}: Please {verb} output name, as {out_dat} exists."
+            command = f"Please {verb} output name or directly load {out_dat}"
+            raise HTTPException(
+                status_code=400,
+                detail=f"{action}: {command}, as that file already exists.",
             )
-        elif loading_saved_file and os.path.exists(out_dat):
-            if not os.path.samefile(input_file, out_dat):
-                action = "OUT ASK ERR"
-                verb = "provide an" if out_name == default_out_name else "change the"
-                command = f"Please {verb} output name or directly load {out_dat}"
-                return api_error(
-                    400, f"{action}: {command}, as that file already exists."
-                )
 
-        opener = None
-        try:
-            print("Opening file: ", str(input_image_file))
+    opener = None
+    try:
+        print("Opening file: ", str(input_image_file))
 
-            (invalid, opener) = return_image_opener(str(input_image_file))
-            if invalid or not opener:
-                return api_error(404, "Image file not found: " + str(input_image_file))
+        (invalid, opener) = return_image_opener(str(input_image_file))
+        if invalid or not opener:
+            raise HTTPFileNotFoundException(input_image_file)
 
-            (num_channels, num_levels, width, height) = opener.get_shape()
+        (num_channels, num_levels, width, height) = opener.get_shape()
 
-            response["maxLevel"] = num_levels - 1
-            response["tilesize"] = opener.tilesize
-            response["height"] = height
-            response["width"] = width
+        response["maxLevel"] = num_levels - 1
+        response["tilesize"] = opener.tilesize
+        response["height"] = height
+        response["width"] = width
 
-        except Exception as e:
-            print(e)
-            return api_error(500, "Invalid tiff file")
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail="Invalid tiff file.")
 
-        try:
-            labels = list(yield_labels(opener, csv_file, chan_label, num_channels))
-        except Exception:
-            return api_error(500, "Error in loading channel marker names")
-
-        fh = logging.FileHandler(str(out_log))
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(FORMATTER)
-        G["logger"].addHandler(fh)
-
-        if not os.path.exists(input_image_file):
-            error_message = f"Input file {input_image_file} does not exist"
-            G["logger"].error(error_message)
-            return api_error(404, error_message)
-
-        return jsonify(
-            {
-                "loaded": True,
-                "channels": labels,
-                "out_name": out_name,
-                "root_dir": str(root_dir),
-                "session": uuid.uuid4().hex,
-                "output_save_file": str(out_dat),
-                "marker_csv_file": str(csv_file),
-                "input_image_file": str(input_image_file),
-                "waypoints": response.get("waypoints", []),
-                "sample_info": response.get(
-                    "sample_info", {"rotation": 0, "name": "", "text": ""}
-                ),
-                "masks": response.get("masks", []),
-                "groups": response.get("groups", []),
-                "tilesize": response.get("tilesize", 1024),
-                "maxLevel": response.get("maxLevel", 1),
-                "height": response.get("height", 1024),
-                "width": response.get("width", 1024),
-                "warning": opener.warning if opener else "",
-                "rgba": opener.is_rgba() if opener else False,
-            }
+    try:
+        labels = list(yield_labels(opener, csv_file, chan_label, num_channels))
+    except Exception as e:
+        logger.exception(e)
+        raise HTTPException(
+            status_code=500, detail="Error in loading channel marker names."
         )
 
+    fh = logging.FileHandler(str(out_log))
+    fh.setLevel(logging.INFO)
+    logger.addHandler(fh)
 
-@app.route("/api/filebrowser", methods=["GET"])
-@cross_origin()
+    if not os.path.exists(input_image_file):
+        error_message = f"Input file {input_image_file} does not exist"
+        logger.error(error_message)
+        raise HTTPFileNotFoundException(input_image_file)
+
+    return {
+        "loaded": True,
+        "channels": labels,
+        "out_name": out_name,
+        "root_dir": str(root_dir),
+        "session": uuid.uuid4().hex,
+        "output_save_file": str(out_dat),
+        "marker_csv_file": str(csv_file),
+        "input_image_file": str(input_image_file),
+        "waypoints": response.get("waypoints", []),
+        "sample_info": response.get(
+            "sample_info", {"rotation": 0, "name": "", "text": ""}
+        ),
+        "masks": response.get("masks", []),
+        "groups": response.get("groups", []),
+        "tilesize": response.get("tilesize", 1024),
+        "maxLevel": response.get("maxLevel", 1),
+        "height": response.get("height", 1024),
+        "width": response.get("width", 1024),
+        "warning": opener.warning if opener else "",
+        "rgba": opener.is_rgba() if opener else False,
+    }
+
+
+class Entry(BaseModel):
+    name: str
+    path: str
+    isDir: bool
+    size: Optional[int]
+    ctime: Optional[int]
+    mtime: Optional[int]
+
+
+class BrowserResponse(BaseModel):
+    entries: List[Entry]
+    path: str
+
+
+@app.get("/api/filebrowser", response_model=BrowserResponse)
 @nocache
-def file_browser():
+def file_browser(path: str, parent: str):
     """
     Endpoint which allows browsing the local file system
 
@@ -1666,16 +1756,15 @@ def file_browser():
         Contents of the directory specified by path
         (or parent directory, if parent parameter is set)
     """
-    folder = request.args.get("path")
+    folder = path
     orig_folder = folder
-    parent = request.args.get("parent")
     if folder is None or folder == "":
         folder = Path.home()
     elif parent == "true":
         folder = Path(folder).parent
 
     if not os.path.exists(folder):
-        return api_error(404, "Path not found")
+        raise HTTPFileNotFoundException(folder)
 
     response = {"entries": [], "path": str(folder)}
 
@@ -1693,20 +1782,24 @@ def file_browser():
                     "isDir": True,
                 }
                 response["entries"].append(new_entry)
-            return jsonify(response)
+            return response
 
     # Return a list of folders and files within the requested folder
-    for entry in os.scandir(folder):
+    for os_stat_result in os.scandir(folder):
         try:
-            is_directory = entry.is_dir()
-            new_entry = {"name": entry.name, "path": entry.path, "isDir": is_directory}
+            is_directory = os_stat_result.is_dir()
+            new_entry = {
+                "name": os_stat_result.name,
+                "path": os_stat_result.path,
+                "isDir": is_directory,
+            }
 
             is_broken = False
-            is_hidden = entry.name[0] == "."
+            is_hidden = os_stat_result.name[0] == "."
 
             if not is_directory:
                 try:
-                    stat_result = entry.stat()
+                    stat_result = os_stat_result.stat()
                     new_entry["size"] = stat_result.st_size
                     new_entry["ctime"] = stat_result.st_ctime
                     new_entry["mtime"] = stat_result.st_mtime
@@ -1718,7 +1811,7 @@ def file_browser():
         except PermissionError:
             pass
 
-    return jsonify(response)
+    return response
 
 
 def _get_drives_win():
@@ -1774,9 +1867,4 @@ if __name__ == "__main__":
     atexit.register(close_masks)
     atexit.register(close_import_pool)
 
-    sys.stdout.reconfigure(line_buffering=True)
-
-    if "--dev" in sys.argv:
-        app.run(debug=False, port=PORT)
-    else:
-        serve(app, listen="127.0.0.1:" + str(PORT), threads=10)
+    uvicorn.run("app.py:app", reload="--dev" in sys.argv, port=PORT)
