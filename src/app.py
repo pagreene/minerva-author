@@ -132,10 +132,10 @@ def copy_vis_csv_files(waypoint_data, json_path):
             try:
                 file_util.copy_file(in_path, out_path)
             except DistutilsFileError as e:
-                print(f"Cannot copy {in_path}")
-                print(e)
+                logger.info(f"Cannot copy {in_path}")
+                logger.exception(e)
         else:
-            print(f"Refusing to copy non-csv infovis: {in_path}")
+            logger.info(f"Refusing to copy non-csv infovis: {in_path}")
 
 
 def get_empty_path(path):
@@ -225,7 +225,7 @@ def return_opener(path, key):
             opener = Opener(path)
             return opener if opener.reader is not None else None
         except (FileNotFoundError, TiffFileError) as e:
-            print(e)
+            logger.exception(e)
             return None
     else:
         return G[key][path]
@@ -236,7 +236,7 @@ def convert_mask(path):
     if os.path.exists(ome_path):
         return
 
-    print(f"Converting {path}")
+    logger.info(f"Converting {path}")
     tmp_dir = "minerva_author_tmp_dir"
     tmp_dir = os.path.join(os.path.dirname(path), tmp_dir)
     tmp_path = os.path.join(tmp_dir, "tmp.tif")
@@ -248,7 +248,7 @@ def convert_mask(path):
     os.rename(tmp_path, ome_path)
     if os.path.exists(tmp_dir) and not len(os.listdir(tmp_dir)):
         os.rmdir(tmp_dir)
-    print(f"Done creating {ome_path}")
+    logger.info(f"Done creating {ome_path}")
 
 
 def open_input_mask(path, convert=False):
@@ -332,12 +332,12 @@ def load_mask_state_subsets(filename):
         state_labels = []
         for row in csv.DictReader(cf):
             if "CellID" not in row:
-                print(f"No CellID found in {filename}")
+                logger.info(f"No CellID found in {filename}")
                 break
             try:
                 cell_id = int(row.get("CellID", None))
             except TypeError:
-                print(f"Cannot parse CellID in {filename}")
+                logger.info(f"Cannot parse CellID in {filename}")
                 continue
 
             # Determine whether to use State or sequentially numbered State
@@ -352,14 +352,14 @@ def load_mask_state_subsets(filename):
                         state_labels.append(state_i)
 
                 if not len(state_labels):
-                    print(f"No State headers found in {filename}")
+                    logger.info(f"No State headers found in {filename}")
                     break
 
             # Load from each State label
             for state_i in state_labels:
                 cell_state = row.get(state_i, "")
                 if cell_state == "":
-                    print(f'Empty {state_i} for CellID "{cell_id}" in {filename}')
+                    logger.info(f'Empty {state_i} for CellID "{cell_id}" in {filename}')
                     continue
 
                 mask_subsets = all_mask_states.get(state_i, {})
@@ -833,7 +833,7 @@ def make_mask_rows(out_dir, mask_data, session):
             )
             all_mask_params[mask_path] = mask_params
         else:
-            print(f"Unable to access mask at {mask_path}")
+            logger.info(f"Unable to access mask at {mask_path}")
 
     return all_mask_params.values()
 
@@ -897,7 +897,7 @@ def add_image_tiles_to_dict(cache_dict, config_rows, opener, out_dir_rel):
         num_levels = opener.get_shape()[1]
         group_dir = settings.get("Group Path", None)
         if group_dir is None:
-            print("Missing group path for image")
+            logger.info("Missing group path for image")
             continue
         # Cache tile parameters for every tile
         for level in range(num_levels):
@@ -958,7 +958,7 @@ def add_mask_tiles_to_dict(cache_dict, mask_config_rows):
         image_params = mask_params.get("images", [None])[0]
         output_path = image_params.get("out_path", None)
         if not all([image_params, output_path]):
-            print("Missing image path for mask")
+            logger.info("Missing image path for mask")
             continue
         # Cache tile parameters for every tile
         for level in range(num_levels):
@@ -1290,7 +1290,7 @@ def api_import(
 
     opener = None
     try:
-        print("Opening file: ", str(input_image_file))
+        logger.info("Opening file: ", str(input_image_file))
 
         (invalid, opener) = return_image_opener(str(input_image_file))
         if invalid or not opener:
@@ -1449,30 +1449,30 @@ def _get_drives_win():
 
 
 def close_tiff():
-    print("Closing tiff files")
+    logger.info("Closing tiff files")
     for opener in G["image_openers"].values():
         try:
             opener.close()
         except Exception as e:
-            print(e)
+            logger.exception(e)
 
 
 def close_masks():
-    print("Closing mask files")
+    logger.info("Closing mask files")
     for opener in G["mask_openers"].values():
         try:
             opener.close()
         except Exception as e:
-            print(e)
+            logger.exception(e)
 
 
 def close_import_pool():
-    print("Closing import pool")
+    logger.info("Closing import pool")
     if G["import_pool"] is not None:
         try:
             G["import_pool"].shutdown()
         except Exception as e:
-            print(e)
+            logger.exception(e)
 
 
 def open_browser():
