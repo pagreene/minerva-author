@@ -17,11 +17,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from distutils import file_util
 from distutils.errors import DistutilsFileError
-from enum import Enum
 from functools import update_wrapper, wraps
 from pathlib import Path
 from threading import Timer
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 # Needed for pyinstaller
 from urllib.parse import unquote
@@ -42,13 +41,24 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
 
 # Local sub-modules
 from pyramid_assemble import main as make_ome
 from render_jpg import _calculate_total_tiles, render_color_tiles
 from render_png import colorize_integer, render_tile, render_u32_tiles
 from opener import Opener
+from src.json_models import (
+    BasicResponse,
+    Validation,
+    MaskSubsets,
+    SessionData,
+    PreviewInput,
+    RenderInput,
+    GroupPath,
+    Groups,
+    ImportResponse,
+    BrowserResponse,
+)
 from storyexport import (
     create_story_base,
     deduplicate_data,
@@ -141,10 +151,6 @@ def copy_vis_csv_files(waypoint_data, json_path):
 def get_empty_path(path):
     basename = os.path.splitext(path)[0]
     return pathlib.Path(f"{basename}_tmp.txt")
-
-
-class BasicResponse(BaseModel):
-    message: str
 
 
 class HTTPFileNotFoundException(HTTPException):
@@ -457,12 +463,6 @@ def out_story(session: str, file_path: str):
         return FileResponse(out_file)
 
 
-class Validation(BaseModel):
-    invalid: bool
-    ready: bool
-    path: str
-
-
 @app.get("/api/validate/u32/{key}", response_model=Validation)
 @nocache
 def u32_validate(key: str):
@@ -486,12 +486,6 @@ def u32_validate(key: str):
         "ready": True if isinstance(opener, Opener) else False,
         "path": opener.path if isinstance(opener, Opener) else "",
     }
-
-
-class MaskSubsets(BaseModel):
-    mask_states: List[str]
-    mask_subsets: List[list]
-    subset_colors: List[List[int]]
 
 
 @app.get("/api/mask_subsets/{key}", response_model=MaskSubsets)
@@ -606,24 +600,6 @@ def make_saved_file(data):
     return new_copy
 
 
-class SampleInfo(BaseModel):
-    rotation: int
-    name: str
-    text: str
-
-
-class SessionData(BaseModel):
-    is_autosave: bool
-    waypoints: list
-    groups: list
-    masks: list
-    sample_info: SampleInfo
-    csv_file: str
-    in_file: str
-    root_dir: str
-    out_name: str
-
-
 @app.post("/api/save/{session}", response_model=BasicResponse)
 @nocache
 def api_save(session: str, session_data: SessionData):
@@ -683,11 +659,6 @@ def create_progress_callback(maximum, session="default", key="default"):
 
     progress_callback(0)
     return progress_callback
-
-
-class ProgressResponse(BaseModel):
-    progress: int
-    max: int
 
 
 @app.get("/api/render/{session}/progress")
@@ -976,14 +947,6 @@ def add_mask_tiles_to_dict(cache_dict, mask_config_rows):
     return cache_dict
 
 
-class PreviewInput(BaseModel):
-    in_file: str
-    out_name: str
-    groups: list
-    masks: list
-    waypoints: list
-
-
 @app.post("/api/preview/{session}", response_model=BasicResponse)
 @nocache
 def api_preview(session: str, preview_input: PreviewInput):
@@ -1029,22 +992,6 @@ def api_preview(session: str, preview_input: PreviewInput):
 
     G["preview_cache"][session] = cache_dict
     return {"message": "OK"}
-
-
-class ImageInfo(BaseModel):
-    description: str
-
-
-class RenderInput(BaseModel):
-    in_file: str
-    root_dir: str
-    out_name: str
-    masks: list
-    groups: list
-    waypoints: list
-    header: str
-    rotation: int
-    image: ImageInfo
 
 
 @app.post("/api/render/{session}", response_model=BasicResponse)
@@ -1098,14 +1045,6 @@ def api_render(session: str, render_input: RenderInput):
         render_u32_tiles(mask_params, 1024, logger)
 
     return {"message": "OK"}
-
-
-class GroupPath(BaseModel):
-    filepath: str
-
-
-class Groups(BaseModel):
-    groups: dict
 
 
 @app.post("/api/import/groups", response_model=Groups)
@@ -1174,33 +1113,6 @@ def is_new_autosave(saved, autosaved):
     else:
         # Malformed autosave
         return False
-
-
-class ImportResponse(BaseModel):
-    loaded: bool
-    channels: list
-    out_name: str
-    root_dir: str
-    session: str
-    output_save_file: str
-    marker_csv_file: str
-    input_image_file: str
-    waypoints: list
-    sample_info: dict
-    masks: list
-    groups: list
-    tilesize: int
-    maxLevel: int
-    height: int
-    width: int
-    warning: str
-    rgba: bool
-
-
-class AutoSaveLogic(str, Enum):
-    skip = "skip"
-    ask = "ask"
-    load = "load"
 
 
 @app.post("/api/import", response_model=ImportResponse)
@@ -1346,20 +1258,6 @@ def api_import(
         "warning": opener.warning if opener else "",
         "rgba": opener.is_rgba() if opener else False,
     }
-
-
-class Entry(BaseModel):
-    name: str
-    path: str
-    isDir: bool
-    size: Optional[int]
-    ctime: Optional[int]
-    mtime: Optional[int]
-
-
-class BrowserResponse(BaseModel):
-    entries: List[Entry]
-    path: str
 
 
 @app.get("/api/filebrowser", response_model=BrowserResponse)
