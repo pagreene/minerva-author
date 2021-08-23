@@ -47,7 +47,8 @@ from pyramid_assemble import main as make_ome
 from render_jpg import _calculate_total_tiles, render_color_tiles
 from render_png import colorize_integer, render_tile, render_u32_tiles
 from opener import Opener
-from src.json_models import (
+from exceptions import HTTPFileNotFoundException
+from json_models import (
     BasicResponse,
     Validation,
     MaskSubsets,
@@ -151,13 +152,6 @@ def copy_vis_csv_files(waypoint_data, json_path):
 def get_empty_path(path):
     basename = os.path.splitext(path)[0]
     return pathlib.Path(f"{basename}_tmp.txt")
-
-
-class HTTPFileNotFoundException(HTTPException):
-    def __init__(self, filename):
-        super(HTTPFileNotFoundException, self).__init__(
-            status_code=404, detail=f"File not found: {filename}."
-        )
 
 
 def reset_globals():
