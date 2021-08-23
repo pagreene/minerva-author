@@ -548,7 +548,7 @@ def reset_globals():
 
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+    """Get absolute path to resource, works for dev and for PyInstaller"""
     try:
         # PyInstaller creates a temp folder at _MEIPASS
         base_path = sys._MEIPASS
