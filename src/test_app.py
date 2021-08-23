@@ -10,6 +10,7 @@ import pytest
 from skimage import io
 
 import app
+import src.opener
 
 
 def escape_url(url):
@@ -36,7 +37,7 @@ def test_make_exhibit_config():
         with open(exhibit_out) as f:
             data_out = json.load(f)
 
-        opener = app.Opener(ome_tif_in)
+        opener = src.opener.Opener(ome_tif_in)
 
         exhibit_config = app.make_exhibit_config(opener, exhibit_name, data_in)
         assert exhibit_config["Groups"] == data_out["Groups"]

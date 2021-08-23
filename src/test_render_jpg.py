@@ -3,7 +3,7 @@ import os
 
 from skimage import io
 
-from app import Opener
+from src.opener import Opener
 from render_jpg import render_color_tiles
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))

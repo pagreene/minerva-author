@@ -9,7 +9,8 @@ from json.decoder import JSONDecodeError
 
 from tifffile.tifffile import TiffFileError
 
-from app import Opener, extract_story_json_stem, make_groups, make_rows, make_stories
+from app import extract_story_json_stem, make_groups, make_rows, make_stories
+from src.opener import Opener
 from render_jpg import render_color_tiles
 from storyexport import deduplicate_data
 
