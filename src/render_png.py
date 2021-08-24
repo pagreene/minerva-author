@@ -121,9 +121,7 @@ def render_u32_tiles(mask_params, tile_size, logger):
             filename = "{}_{}_{}.{}".format(level, tx, ty, EXT)
 
             try:
-                opener.save_mask_tiles(
-                    filename, mask_params, logger, tile_size, level, tx, ty
-                )
+                opener.save_mask_tiles(filename, mask_params, tile_size, level, tx, ty)
             except AttributeError as e:
                 logger.error(f"{level} ty {ty} tx {tx}: {e}")
 

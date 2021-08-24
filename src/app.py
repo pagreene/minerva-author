@@ -28,8 +28,6 @@ from urllib.parse import unquote
 from imagecodecs import _imcd, _jpeg2k, _jpeg8, _zlib  # noqa
 from numcodecs import blosc, compat_ext  # noqa
 
-# Math tools
-
 # File type tools
 from tifffile.tifffile import TiffFileError
 
@@ -290,18 +288,6 @@ def cache_mask_opener(path, opener):
     return cache_opener(path, opener, "mask_openers", mask_lock)
 
 
-def return_opener(path, key):
-    if path not in G[key]:
-        try:
-            opener = Opener(path)
-            return opener if opener.reader is not None else None
-        except (FileNotFoundError, TiffFileError) as e:
-            logger.exception(e)
-            return None
-    else:
-        return G[key][path]
-
-
 def convert_mask(path):
     ome_path = tif_path_to_ome_path(path)
     if os.path.exists(ome_path):
@@ -327,14 +313,14 @@ def open_input_mask(path, convert=False):
     invalid = True
     ext = check_ext(path)
     if ext == ".ome.tif" or ext == ".ome.tiff":
-        opener = return_opener(path, "mask_openers")
+        opener = Opener.get_opener(path)
     elif ext == ".tif" or ext == ".tiff":
         ome_path = tif_path_to_ome_path(path)
         convertable = os.path.exists(path) and not os.path.exists(ome_path)
         if convert and convertable:
             G["import_pool"].submit(convert_mask, path)
         elif os.path.exists(ome_path):
-            opener = return_opener(ome_path, "mask_openers")
+            opener = Opener.get_opener(path)
             path = ome_path
         invalid = False
 
@@ -373,7 +359,7 @@ def return_mask_opener(path, convert):
 
 
 def return_image_opener(path):
-    opener = return_opener(path, "image_openers")
+    opener = Opener.get_opener(path)
     success = cache_image_opener(path, opener)
     return (not success, opener)
 
