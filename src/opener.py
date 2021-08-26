@@ -1,5 +1,6 @@
-import os
 import logging
+from io import BytesIO
+from typing import Optional, Iterator
 
 import numpy as np
 import ome_types
@@ -10,10 +11,9 @@ from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 from tifffile import TiffFile
 
-from src.app import check_ext, G, get_empty_path
-from src.render_jpg import composite_channel
-from src.render_png import colorize_mask
-
+from render_jpg import composite_channel
+from render_png import colorize_mask
+from util import check_ext, get_empty_path, Path
 
 logger = logging.getLogger("minerva-author-opener")
 
@@ -51,7 +51,7 @@ class ZarrWrapper:
 
 
 class Opener:
-    def __init__(self, path):
+    def __init__(self, path: Path):
         self.warning = ""
         self.path = path
         self.tilesize = 1024
@@ -104,9 +104,7 @@ class Opener:
         for image_params in mask_params["images"]:
 
             output_file = str(image_params["out_path"] / filename)
-            path_exists = os.path.exists(output_file) or os.path.exists(
-                get_empty_path(output_file)
-            )
+            path_exists = output_file.exits() or get_empty_path(output_file).exists()
             should_skip = path_exists and image_params.get("is_up_to_date", False)
             should_skip_tiles[output_file] = should_skip
 
@@ -123,6 +121,12 @@ class Opener:
     def save_tile(self, output_file, settings, tile_size, level, tx, ty):
         img = self.return_tile(output_file, settings, tile_size, level, tx, ty)
         img.save(output_file, quality=85)
+
+
+class MaskTile:
+    def __init__(self, img: Optional[Image.Image], file: Path):
+        self.img = img
+        self.file = file
 
 
 class TiffOpener(Opener):
@@ -279,13 +283,13 @@ class TiffOpener(Opener):
 
     def generate_mask_tiles(
         self, filename, mask_params, tile_size, level, tx, ty, should_skip_tiles={}
-    ):
+    ) -> Iterator[MaskTile]:
         tile = self.get_tifffile_tile(level, tx, ty, 0, tile_size)
 
         for image_params in mask_params["images"]:
 
-            output_file = str(image_params["out_path"] / filename)
-            if should_skip_tiles.get(output_file, False):
+            output_file = image_params["out_path"] / filename
+            if should_skip_tiles.get(str(output_file), False):
                 continue
 
             target = np.zeros(tile.shape + (4,), np.uint8)
@@ -308,10 +312,10 @@ class TiffOpener(Opener):
 
             if skip_empty_tile:
                 empty_file = get_empty_path(output_file)
-                yield {"img": None, "empty_file": empty_file}
+                yield MaskTile(None, empty_file)
             else:
                 img = Image.frombytes("RGBA", target.T.shape[1:], target.tobytes())
-                yield {"img": img, "output_file": output_file}
+                yield MaskTile(img, output_file)
 
     def save_mask_tiles(self, filename, mask_params, tile_size, level, tx, ty):
         should_skip_tiles = super(TiffOpener, self).save_mask_tiles(
@@ -323,16 +327,17 @@ class TiffOpener(Opener):
         )
 
         for mask_tile in mask_tiles:
-            img = mask_tile.get("img", None)
-            empty_file = mask_tile.get("empty_file", None)
-            output_file = mask_tile.get("output_file", None)
-
-            if all([img, output_file]):
-                img.save(output_file, compress_level=1)
-            elif empty_file is not None:
-                if not os.path.exists(empty_file):
-                    with open(empty_file, "w"):
-                        pass
+            if mask_tile.img:
+                img_bytes = BytesIO()
+                mask_tile.img.save(
+                    img_bytes,
+                    compress_level=1,
+                    format=mask_tile.file.suffix.lower()[1:],
+                )
+                mask_tile.file.write_bytes(img_bytes.getvalue())
+            elif mask_tile.file is not None:
+                if not mask_tile.file.exists():
+                    mask_tile.file.touch()
 
         return should_skip_tiles
 

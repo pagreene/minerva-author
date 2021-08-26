@@ -12,13 +12,11 @@ import itertools
 import json
 import logging
 import multiprocessing
-import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from distutils import file_util
 from distutils.errors import DistutilsFileError
 from functools import update_wrapper, wraps
-from pathlib import Path
 from threading import Timer
 from typing import Callable, Optional, List
 
@@ -28,8 +26,7 @@ from urllib.parse import unquote
 from imagecodecs import _imcd, _jpeg2k, _jpeg8, _zlib  # noqa
 from numcodecs import blosc, compat_ext  # noqa
 
-# File type tools
-from tifffile.tifffile import TiffFileError
+from pydantic import BaseModel
 
 # Web App tools
 import webbrowser
@@ -58,6 +55,8 @@ from json_models import (
     ImportResponse,
     BrowserResponse,
 )
+from session_manager import S3SessionManager, LocalSessionManager
+from util import resource_path, check_ext, Path
 from storyexport import (
     create_story_base,
     deduplicate_data,
@@ -80,22 +79,16 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger("minerva-author-app")
 
 
-def check_ext(path):
-    base, ext1 = os.path.splitext(path)
-    ext2 = os.path.splitext(base)[1]
-    return ext2 + ext1
-
-
-def tif_path_to_ome_path(path):
-    base, ext = os.path.splitext(path)
-    return f"{base}.ome{ext}"
+def tif_path_to_ome_path(path_obj: Path):
+    ext = path_obj.suffix
+    return path_obj.with_suffix(f".ome{ext}")
 
 
 def extract_story_json_stem(input_file):
     default_out_name = input_file.stem
     # Handle extracting the actual stem from .story.json files
-    if pathlib.Path(default_out_name).suffix in [".story"]:
-        default_out_name = pathlib.Path(default_out_name).stem
+    if Path(default_out_name).suffix in [".story"]:
+        default_out_name = Path(default_out_name).stem
     return default_out_name
 
 
@@ -137,7 +130,7 @@ def copy_vis_csv_files(waypoint_data, json_path):
 
     # Copy the visualization csv files to an infovis directory
     for in_path, out_path in vis_path_dict_out.items():
-        if pathlib.Path(in_path).suffix in [".csv"]:
+        if Path(in_path).suffix in [".csv"]:
             try:
                 file_util.copy_file(in_path, out_path)
             except DistutilsFileError as e:
@@ -145,77 +138,6 @@ def copy_vis_csv_files(waypoint_data, json_path):
                 logger.exception(e)
         else:
             logger.info(f"Refusing to copy non-csv infovis: {in_path}")
-
-
-def get_empty_path(path):
-    basename = os.path.splitext(path)[0]
-    return pathlib.Path(f"{basename}_tmp.txt")
-
-
-class SessionManager:
-    """This defines the API for managing user sessions."""
-
-    def get_session(self, session_key: str) -> Optional[dict]:
-        raise NotImplementedError
-
-    @staticmethod
-    def make_session() -> (str, dict):
-        session_id = str(uuid.uuid4())
-        session_data = {}
-        return session_id, session_data
-
-    def update_session(self, session_key: str, session_data: dict) -> None:
-        raise NotImplementedError
-
-
-class S3SessionManager(SessionManager):
-    def __init__(self, root_path):
-        m = re.match("^s3://(.*?)/(.*?)$", root_path)
-        if m is None:
-            raise ValueError(f"Invalid s3 path: {root_path}")
-        bucket, self.prefix = m.groups()
-
-    @property
-    def __s3(self):
-        import boto3
-
-        session = boto3.Session()
-        return session.client("s3")
-
-    def __make_s3_key(self, session_key: str) -> str:
-        """Make the full s3 key, combining the session key and the prefix."""
-        return f"{self.prefix}{session_key}.json"
-
-    def get_session(self, session_key: str) -> Optional[dict]:
-        from botocore.exceptions import ClientError
-
-        try:
-            resp = self.__s3.get_object(
-                Bucket=self.bucket, Key=self.__make_s3_key(session_key)
-            )
-        except ClientError as err:
-            if err.response["Error"]["Code"] == "NoSuchKey":
-                return None
-            raise
-        return json.loads(resp["Body"].read())
-
-    def update_session(self, session_key: str, session_data: dict) -> None:
-        self.__s3.put_object(
-            Bucket=self.bucket,
-            Key=self.__make_s3_key(session_key),
-            Body=json.dumps(session_data),
-        )
-
-
-class LocalSessionManager(SessionManager):
-    def __init__(self):
-        self.__sessions = {}
-
-    def get_session(self, session_key: str) -> Optional[dict]:
-        return self.__sessions.get(session_key)
-
-    def update_session(self, session_key: str, session_data: dict) -> None:
-        self.__sessions[session_key] = session_data
 
 
 if "MINERVA_AUTHOR_SESSION_STORE_ROOT" in os.environ:
@@ -233,17 +155,6 @@ def reset_globals():
         "save_progress_max": {},
     }
     return _g
-
-
-def resource_path(relative_path):
-    """Get absolute path to resource, works for dev and for PyInstaller"""
-    try:
-        # PyInstaller creates a temp folder at _MEIPASS
-        base_path = sys._MEIPASS
-    except AttributeError:
-        base_path = os.path.abspath(".")
-
-    return os.path.join(base_path, relative_path)
 
 
 G = reset_globals()
@@ -288,43 +199,49 @@ def cache_mask_opener(path, opener):
     return cache_opener(path, opener, "mask_openers", mask_lock)
 
 
-def convert_mask(path):
-    ome_path = tif_path_to_ome_path(path)
-    if os.path.exists(ome_path):
+def convert_mask(mask_path: Path):
+    # Deduce the name of the OME TIF File, return if it already exists.
+    ome_path = tif_path_to_ome_path(mask_path)
+    if ome_path.exists():
         return
+    logger.info(f"Converting {mask_path}")
 
-    logger.info(f"Converting {path}")
-    tmp_dir = "minerva_author_tmp_dir"
-    tmp_dir = os.path.join(os.path.dirname(path), tmp_dir)
-    tmp_path = os.path.join(tmp_dir, "tmp.tif")
-    if not os.path.exists(tmp_dir):
-        os.mkdir(tmp_dir)
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    make_ome([pathlib.Path(path)], pathlib.Path(tmp_path), is_mask=True, pixel_size=1)
-    os.rename(tmp_path, ome_path)
-    if os.path.exists(tmp_dir) and not len(os.listdir(tmp_dir)):
-        os.rmdir(tmp_dir)
+    # Define the temp directory and file path.
+    tmp_path = mask_path.parent / "minerva_author_tmp_dir" / "tmp.tif"
+
+    # Make sure the directory exists and the path does not.
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.unlink(missing_ok=True)
+
+    # Make the OME TIF and move the temp to its final home.
+    make_ome([mask_path], tmp_path, is_mask=True, pixel_size=1)
+    tmp_path.rename(ome_path)
+
+    # Clean up the temp directory.
+    try:
+        tmp_path.parent.rmdir()
+    except (OSError, FileNotFoundError):
+        pass
     logger.info(f"Done creating {ome_path}")
 
 
-def open_input_mask(path, convert=False):
+def open_input_mask(mask_path: Path, convert=False):
     opener = None
     invalid = True
-    ext = check_ext(path)
+    ext = check_ext(mask_path)
     if ext == ".ome.tif" or ext == ".ome.tiff":
-        opener = Opener.get_opener(path)
+        opener = Opener.get_opener(mask_path)
     elif ext == ".tif" or ext == ".tiff":
-        ome_path = tif_path_to_ome_path(path)
-        convertable = os.path.exists(path) and not os.path.exists(ome_path)
+        ome_path = tif_path_to_ome_path(mask_path)
+        convertable = mask_path.exists() and not ome_path.exists()
         if convert and convertable:
-            G["import_pool"].submit(convert_mask, path)
-        elif os.path.exists(ome_path):
-            opener = Opener.get_opener(path)
-            path = ome_path
+            G["import_pool"].submit(convert_mask, mask_path)
+        elif ome_path.exists():
+            opener = Opener.get_opener(mask_path)
+            mask_path = ome_path
         invalid = False
 
-    success = cache_mask_opener(path, opener)
+    success = cache_mask_opener(mask_path, opener)
     return False if success else invalid
 
 
@@ -340,7 +257,7 @@ def check_mask_opener(path):
         opener = G["mask_openers"].get(ome_path)
 
     # Remove invalid openers
-    if opener and not os.path.exists(opener.path):
+    if opener and not opener.path.exists():
         mask_lock.acquire()
         opener.close()
         G["mask_openers"].pop(opener.path, None)
@@ -350,18 +267,18 @@ def check_mask_opener(path):
     return opener
 
 
-def return_mask_opener(path, convert):
+def return_mask_opener(mask_path: Path, convert: bool):
     invalid = True
-    if check_mask_opener(path) is None:
-        invalid = open_input_mask(path, convert)
-    opener = check_mask_opener(path)
-    return (invalid, opener)
+    if check_mask_opener(mask_path) is None:
+        invalid = open_input_mask(mask_path, convert)
+    opener = check_mask_opener(mask_path)
+    return invalid, opener
 
 
-def return_image_opener(path):
-    opener = Opener.get_opener(path)
-    success = cache_image_opener(path, opener)
-    return (not success, opener)
+def return_image_opener(img_path: Path):
+    opener = Opener.get_opener(img_path)
+    success = cache_image_opener(img_path, opener)
+    return not success, opener
 
 
 def nocache(view: Callable):
@@ -379,22 +296,21 @@ def nocache(view: Callable):
     return update_wrapper(no_cache, view)
 
 
-def load_mask_state_subsets(filename):
+def load_mask_state_subsets(file_path: Path):
     all_mask_states = {}
-    path = pathlib.Path(filename)
-    if not path.is_file() or path.suffix != ".csv":
+    if not file_path.is_file() or file_path.suffix != ".csv":
         return None
 
-    with open(path, encoding="utf-8-sig") as cf:
+    with file_path.open(encoding="utf-8-sig") as cf:
         state_labels = []
         for row in csv.DictReader(cf):
             if "CellID" not in row:
-                logger.info(f"No CellID found in {filename}")
+                logger.info(f"No CellID found in {file_path}")
                 break
             try:
                 cell_id = int(row.get("CellID", None))
             except TypeError:
-                logger.info(f"Cannot parse CellID in {filename}")
+                logger.info(f"Cannot parse CellID in {file_path}")
                 continue
 
             # Determine whether to use State or sequentially numbered State
@@ -409,14 +325,16 @@ def load_mask_state_subsets(filename):
                         state_labels.append(state_i)
 
                 if not len(state_labels):
-                    logger.info(f"No State headers found in {filename}")
+                    logger.info(f"No State headers found in {file_path}")
                     break
 
             # Load from each State label
             for state_i in state_labels:
                 cell_state = row.get(state_i, "")
                 if cell_state == "":
-                    logger.info(f'Empty {state_i} for CellID "{cell_id}" in {filename}')
+                    logger.info(
+                        f'Empty {state_i} for CellID "{cell_id}" in {file_path}'
+                    )
                     continue
 
                 mask_subsets = all_mask_states.get(state_i, {})
@@ -493,18 +411,19 @@ def out_story(session: str, file_path: str):
         file_path: any file path in story preview
     Returns: content of any given file
     """
-    cache_dict = G["preview_cache"].get(session, {})
-    path_cache = cache_dict.get(file_path, None)
-
-    if path_cache is None:
+    cache_dict = preview_cache.get_session(session)
+    if cache_dict is None:
         raise HTTPException(
             status_code=404,
             detail="Cache not found: Please restart Minerva Author to reload your save file.",
         )
 
+    path_cache = cache_dict.get(file_path, None)
     args = path_cache.get("args", [])
     kwargs = path_cache.get("kwargs", {})
     mimetype = path_cache.get("mimetype", None)
+
+    # TODO: come back to this
     function = path_cache.get("function", lambda: None)
     out_file = function(*args, **kwargs)
 
@@ -527,10 +446,10 @@ def u32_validate(key: str):
         ready: whether the ome-tiff version of the path is ready
         path: the ome-tiff version of the path
     """
-    path = unquote(key)
+    mask_path = Path(unquote(key))
 
     # Open the input file on the first request only
-    (invalid, opener) = return_mask_opener(path, convert=True)
+    (invalid, opener) = return_mask_opener(mask_path, convert=True)
 
     return {
         "invalid": invalid,
@@ -550,14 +469,16 @@ def mask_subsets(key: str):
     Returns: Dictionary mapping mask subsets to cell ids
 
     """
-    path = unquote(key)
+    mask_path = Path(unquote(key))
 
-    if not os.path.exists(path):
-        raise HTTPFileNotFoundException(path)
+    if not mask_path.exists():
+        raise HTTPFileNotFoundException(mask_path)
 
-    mask_state_subsets = load_mask_state_subsets(path)
+    mask_state_subsets = load_mask_state_subsets(mask_path)
     if mask_state_subsets is None:
-        raise HTTPException(status_code=404, detail=f'No mask states found at "{path}"')
+        raise HTTPException(
+            status_code=404, detail=f'No mask states found at "{mask_path}"'
+        )
 
     mask_states = []
     mask_subsets = []
@@ -588,10 +509,10 @@ def u32_image(key: str, level: int, x: int, y: int):
 
     """
     img_io = None
-    path = unquote(key)
+    img_path = Path(unquote(key))
 
     # Open the input file without allowing any conversion
-    (invalid, opener) = return_mask_opener(path, convert=False)
+    invalid, opener = return_mask_opener(img_path, convert=False)
 
     if isinstance(opener, Opener):
         img_io = render_tile(opener, level, x, y, 0, "RGBA")
@@ -620,10 +541,10 @@ def u16_image(key: str, channel: int, level: int, x: int, y: int):
 
     """
     img_io = None
-    path = unquote(key)
+    img_path = Path(unquote(key))
 
     # Open the input file if not already open
-    (invalid, opener) = return_image_opener(path)
+    invalid, opener = return_image_opener(img_path)
 
     if opener and not invalid:
         img_io = render_tile(opener, int(level), int(x), int(y), int(channel))
@@ -664,11 +585,10 @@ def api_save(session: str, session_data: SessionData):
     """
     data = make_saved_file(session_data.dict())
 
-    root_dir = data["root_dir"]
-    out_name = data["out_name"]
+    root_dir = Path(data["root_dir"])
+    out_name = Path(data["out_name"])
 
-    if not os.path.exists(root_dir):
-        os.makedirs(root_dir)
+    root_dir.mkdir(parents=True, exist_ok=True)
 
     out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
 
@@ -692,7 +612,7 @@ def api_save(session: str, session_data: SessionData):
 
     # Make a copy of the visualization csv files
     # for use with save_exhibit_pyramid.py
-    copy_vis_csv_files(data["waypoints"], pathlib.Path(out_dat))
+    copy_vis_csv_files(data["waypoints"], Path(out_dat))
 
     return {"message": "OK!"}
 
@@ -848,9 +768,7 @@ def make_mask_rows(out_dir, mask_data, session):
                         "source": str(mask_path),
                     },
                     "progress": create_progress_callback(mask_total, session, str(i)),
-                    "out_path": pathlib.Path(
-                        mask_path_from_index(mask_data, i, out_dir)
-                    ),
+                    "out_path": Path(mask_path_from_index(mask_data, i, out_dir)),
                 }
             )
             all_mask_params[mask_path] = mask_params
@@ -911,9 +829,17 @@ def render_image_tile(output_file, settings, **kwargs):
     return img_io
 
 
-def add_image_tiles_to_dict(cache_dict, config_rows, opener, out_dir_rel):
-    output_path = pathlib.Path(out_dir_rel)
+class CacheEntry(BaseModel):
+    data: str
+    mimetype: str
+    args: List[str]
+    kwargs: dict
+
+
+def add_image_tiles_to_dict(config_rows, opener, output_path: Path):
     ext = "jpg"
+
+    new_entries = {}
 
     for settings in config_rows:
         num_levels = opener.get_shape()[1]
@@ -925,22 +851,21 @@ def add_image_tiles_to_dict(cache_dict, config_rows, opener, out_dir_rel):
         for level in range(num_levels):
             (nx, ny) = opener.get_level_tiles(level, 1024)
             for ty, tx in itertools.product(range(0, ny), range(0, nx)):
-                filename = "{}_{}_{}.{}".format(level, tx, ty, ext)
+                filename = f"{level}_{tx}_{ty}.{ext}"
                 output_file = str(output_path / group_dir / filename)
-                cache_dict[output_file] = {
-                    "function": render_image_tile,
-                    "mimetype": f"image/{ext}",
-                    "args": [output_file, settings],
-                    "kwargs": {
+                new_entries[output_file] = CacheEntry(
+                    data=None,
+                    mimetype=f"image/{ext}",
+                    args=[output_file, settings],
+                    kwargs={
                         "opener": opener,
                         "tile_size": 1024,
                         "level": level,
                         "tx": tx,
                         "ty": ty,
                     },
-                }
-
-    return cache_dict
+                )
+    return new_entries
 
 
 def render_mask_tile(filename, mask_params, **kwargs):
@@ -1009,8 +934,6 @@ def api_preview(session: str, preview_input: PreviewInput):
     Returns: OK on success
 
     """
-    global G
-
     cache_dict = {}
 
     path = preview_input.in_file
@@ -1018,7 +941,7 @@ def api_preview(session: str, preview_input: PreviewInput):
     (invalid, opener) = return_image_opener(path)
     # Ensure path is relative to output directory
     out_dir_rel = get_story_folders(out_name, "")[0]
-    out_dir_rel = pathlib.Path(*pathlib.Path(out_dir_rel).parts[1:])
+    out_dir_rel = Path(*Path(out_dir_rel).parts[1:])
 
     if invalid or not opener:
         raise HTTPFileNotFoundException(path)
@@ -1031,7 +954,7 @@ def api_preview(session: str, preview_input: PreviewInput):
         "args": [exhibit_config],
         "mimetype": "text/json",
     }
-    index_filename = os.path.join(get_story_dir(), "index.html")
+    index_filename = get_story_dir() / "index.html"
     cache_dict["index.html"] = {"function": lambda: index_filename}
 
     vis_path_dict = deduplicate_data(preview_input.waypoints, "data")
@@ -1041,7 +964,7 @@ def api_preview(session: str, preview_input: PreviewInput):
     cache_dict = add_mask_tiles_to_dict(cache_dict, mask_config_rows)
     cache_dict = add_image_tiles_to_dict(cache_dict, config_rows, opener, out_dir_rel)
 
-    G["preview_cache"][session] = cache_dict
+    preview_cache.update_session(session, cache_dict)
     return {"message": "OK"}
 
 
@@ -1101,8 +1024,8 @@ def api_render(session: str, render_input: RenderInput):
 @app.post("/api/import/groups", response_model=Groups)
 @nocache
 def api_import_groups(group_path: GroupPath):
-    input_file = pathlib.Path(group_path.filepath)
-    if not os.path.exists(input_file):
+    input_file = Path(group_path.filepath)
+    if not input_file.exists():
         raise HTTPFileNotFoundException(input_file)
 
     saved = load_saved_file(input_file)[0]
@@ -1115,11 +1038,10 @@ def api_import_groups(group_path: GroupPath):
 
 
 def load_saved_file(input_file):
-    saved = None
     autosaved = None
-    input_path = pathlib.Path(input_file)
+    input_path = Path(input_file)
     if not input_path.exists():
-        return (None, None)
+        return None, None
 
     if input_path.suffix == ".dat":
         saved = pickle.load(open(input_path, "rb"))
@@ -1128,7 +1050,7 @@ def load_saved_file(input_file):
             saved = json.load(json_file)
             autosaved = saved.get("autosave")
 
-    return (saved, autosaved)
+    return saved, autosaved
 
 
 def copy_saved_states(from_save, to_save):
@@ -1177,12 +1099,12 @@ def api_import(
     response = {}
     chan_label = {}
     default_out_name = "out"
-    input_file = pathlib.Path(filepath)
-    input_image_file = pathlib.Path(filepath)
+    input_file = Path(filepath)
+    input_image_file = Path(filepath)
     loading_saved_file = input_file.suffix in [".dat", ".json"]
     root_dir = get_current_dir()
 
-    if not os.path.exists(input_file):
+    if not input_file.exists():
         raise HTTPFileNotFoundException(input_file)
 
     if loading_saved_file:
@@ -1191,7 +1113,7 @@ def api_import(
         autosave_error = autosave_logic == "ask"
 
         (saved, autosaved) = load_saved_file(input_file)
-        root_dir = os.path.dirname(input_file)
+        root_dir = input_file.parent
 
         if is_new_autosave(saved, autosaved):
             # We need to know whether to use autosave file
@@ -1203,14 +1125,14 @@ def api_import(
             elif autosave_logic == "load":
                 saved = copy_saved_states(autosaved, saved)
 
-        input_image_file = pathlib.Path(saved["in_file"])
+        input_image_file = Path(saved["in_file"])
 
         if csvpath:
-            csv_file = pathlib.Path(csvpath)
-            if not os.path.exists(csv_file):
+            csv_file = Path(csvpath)
+            if not csv_file.exists():
                 raise HTTPFileNotFoundException(f'marker csv file "{csv_file}"')
         else:
-            csv_file = pathlib.Path(saved["csv_file"])
+            csv_file = Path(saved["csv_file"])
         if "sample_info" in saved:
             response["sample_info"] = saved["sample_info"]
             if "rotation" not in response["sample_info"]:
@@ -1226,7 +1148,7 @@ def api_import(
             for chan in group["channels"]:
                 chan_label[str(chan["id"])] = chan["label"]
     else:
-        csv_file = pathlib.Path(csvpath)
+        csv_file = Path(csvpath)
 
     out_name = label_to_dir(dataset, empty=default_out_name)
     if out_name == "":
@@ -1234,15 +1156,15 @@ def api_import(
 
     out_dir, out_yaml, out_dat, out_log = get_story_folders(out_name, root_dir)
 
-    if not loading_saved_file and os.path.exists(out_dat):
+    if not loading_saved_file and out_dat.exists():
         action = "OUT ASK ERR"
         verb = "provide an" if out_name == default_out_name else "change the"
         raise HTTPException(
             status_code=400,
             detail=f"{action}: Please {verb} output name, as {out_dat} exists.",
         )
-    elif loading_saved_file and os.path.exists(out_dat):
-        if not os.path.samefile(input_file, out_dat):
+    elif loading_saved_file and out_dat.exists():
+        if not input_file.samefile(out_dat):
             action = "OUT ASK ERR"
             verb = "provide an" if out_name == default_out_name else "change the"
             command = f"Please {verb} output name or directly load {out_dat}"
@@ -1282,7 +1204,7 @@ def api_import(
     fh.setLevel(logging.INFO)
     logger.addHandler(fh)
 
-    if not os.path.exists(input_image_file):
+    if not input_image_file.exists():
         error_message = f"Input file {input_image_file} does not exist"
         logger.error(error_message)
         raise HTTPFileNotFoundException(input_image_file)
@@ -1331,7 +1253,7 @@ def file_browser(path: str, parent: str):
     elif parent == "true":
         folder = Path(folder).parent
 
-    if not os.path.exists(folder):
+    if not folder.exists():
         raise HTTPFileNotFoundException(folder)
 
     response = {"entries": [], "path": str(folder)}

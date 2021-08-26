@@ -1,9 +1,10 @@
 import os
-import pathlib
 import re
 import sys
 from distutils import file_util
 from distutils.errors import DistutilsFileError
+
+from util import Path
 
 
 def label_to_dir(s, empty="0"):
@@ -106,17 +107,17 @@ def group_path_from_label(group_data, label, data_dir=""):
     return dedup_label_to_path(group_data, data_dir)[label]
 
 
-def get_current_dir():
-    return os.path.dirname(os.path.abspath(sys.argv[0]))
+def get_current_dir() -> Path:
+    return Path(sys.argv[0]).absolute().parent
 
 
-def get_story_dir():
+def get_story_dir() -> Path:
     try:
         # If running pyinstaller executable, _MEIPASS will contain path to the data directory in tmp
-        story_dir = os.path.join(sys._MEIPASS, "minerva-story")
+        story_dir = Path(sys._MEIPASS) / "minerva-story"
     except Exception:
         # Not running pyinstaller executable; minerva-story should exist in parent directory
-        story_dir = os.path.join(get_current_dir(), "..", "minerva-story")
+        story_dir = get_current_dir() / ".." / "minerva-story"
 
     return story_dir
 
@@ -151,7 +152,7 @@ def create_story_base(title, waypoints, masks, folder=""):
         os.makedirs(path_i, exist_ok=True)
 
     for in_path, out_path in vis_path_dict.items():
-        if pathlib.Path(in_path).suffix in [".csv"]:
+        if Path(in_path).suffix in [".csv"]:
             try:
                 file_util.copy_file(in_path, out_path)
             except DistutilsFileError as e:
@@ -187,4 +188,4 @@ def get_story_folders(title, folder="", create=False):
     if create:
         os.makedirs(images_folder, exist_ok=True)
 
-    return out_dir, out_json_config, out_json_save, out_log
+    return Path(out_dir), Path(out_json_config), Path(out_json_save), Path(out_log)

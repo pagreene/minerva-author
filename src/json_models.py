@@ -4,6 +4,31 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 
+class Waypoint(BaseModel):
+    name: str
+    description: str
+    arrows: list
+    overlays: list
+    group: str
+    masks: list
+    active_masks: list
+    zoom: int
+    pan: int
+
+
+class Story(BaseModel):
+    name: str
+    description: str
+    waypoints: List[Waypoint]
+
+
+class Group(BaseModel):
+    name: str
+    path: str
+    colors: List[str]
+    channels: List[str]
+
+
 class BasicResponse(BaseModel):
     message: str
 

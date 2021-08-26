@@ -2,7 +2,6 @@ import argparse
 import json
 import logging
 import os
-import pathlib
 from distutils import file_util
 from distutils.errors import DistutilsFileError
 from json.decoder import JSONDecodeError
@@ -10,7 +9,8 @@ from json.decoder import JSONDecodeError
 from tifffile.tifffile import TiffFileError
 
 from app import extract_story_json_stem, make_groups, make_rows, make_stories
-from src.opener import Opener
+from opener import Opener
+from util import Path
 from render_jpg import render_color_tiles
 from storyexport import deduplicate_data
 
@@ -33,7 +33,7 @@ def copy_vis_csv_files(waypoint_data, json_path, output_dir, vis_dir):
 
     # Copy the visualization csv files to a "data" directory
     for key_path, in_path in vis_path_dict_in.items():
-        if pathlib.Path(in_path).suffix in [".csv"]:
+        if Path(in_path).suffix in [".csv"]:
             try:
                 out_path = vis_path_dict_out[key_path]
                 file_util.copy_file(in_path, out_path)
@@ -136,19 +136,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "ome_tiff",
         metavar="ome_tiff",
-        type=pathlib.Path,
+        type=Path,
         help="Input path to OME-TIFF with all channel groups",
     )
     parser.add_argument(
         "author_json",
         metavar="author_json",
-        type=pathlib.Path,
+        type=Path,
         help="Input Minerva Author save file with channel configuration",
     )
     parser.add_argument(
         "output_dir",
         metavar="output_dir",
-        type=pathlib.Path,
+        type=Path,
         help="Output directory for exhibit and rendered JPEG pyramid",
     )
     parser.add_argument(
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vis",
         metavar="vis",
-        type=pathlib.Path,
+        type=Path,
         default=None,
         help="Input data visualization directory (default constructed from author .json)",
     )

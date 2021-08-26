@@ -86,20 +86,18 @@ def render_u32_tiles(mask_params, tile_size, logger):
         settings = image_params["settings"]
 
         output_path = image_params["out_path"]
-
-        if not output_path.exists():
-            output_path.mkdir(parents=True)
+        output_path.mkdir(parents=True, exists_ok=True)
 
         config_path = output_path / "config.json"
 
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+        if config_path.exists():
+            with config_path.open("r") as f:
                 try:
                     old_settings = json.load(f)
                 except json.decoder.JSONDecodeError as err:
                     print(err)
 
-        with open(config_path, "w") as f:
+        with config_path.open("w") as f:
             json.dump(settings, f)
 
         image_params["is_up_to_date"] = settings == old_settings

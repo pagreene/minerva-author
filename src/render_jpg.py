@@ -1,14 +1,8 @@
-from __future__ import division, print_function
-
 import itertools
-
-try:
-    import pathlib
-except ImportError:
-    import pathlib2 as pathlib
-
 import json
 import os
+
+from util import Path
 
 
 def composite_channel(target, image, color, range_min, range_max):
@@ -58,24 +52,22 @@ def render_color_tiles(
 
     print("Processing:", str(opener.path))
 
-    output_path = pathlib.Path(output_dir)
-
-    if not output_path.exists():
-        output_path.mkdir(parents=True)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exists_ok=True)
 
     config_path = output_path / "config.json"
     old_rows = []
 
     if allow_cache:
 
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+        if config_path.exists():
+            with config_path.open("r") as f:
                 try:
                     old_rows = json.load(f)
                 except json.decoder.JSONDecodeError as err:
                     print(err)
 
-        with open(config_path, "w") as f:
+        with config_path.open("w") as f:
             json.dump(config_rows, f)
 
     num_levels = opener.get_shape()[1]

@@ -1,8 +1,9 @@
 import argparse
 import json
 import os
-import pathlib
 from json.decoder import JSONDecodeError
+
+from util import Path
 
 
 def make_channel(ch_key, ch):
@@ -34,7 +35,7 @@ def main(omero_json, author_json):
 
     story_json_checks = [
         (author_json, [".json"]),
-        (pathlib.Path(author_json.stem), [".groups", ".story"]),
+        (Path(author_json.stem), [".groups", ".story"]),
     ]
     test_suffix = lambda check: check[0].suffix in check[1]
     if not all(map(test_suffix, story_json_checks)):
@@ -45,7 +46,7 @@ def main(omero_json, author_json):
         )
         return
 
-    if os.path.exists(author_json):
+    if author_json.exists():
         print(f"Overwriting existing save file {author_json}")
     else:
         print(f"Writing to new save file {author_json}")
@@ -55,14 +56,14 @@ def main(omero_json, author_json):
 
     omero_channels = {}
     try:
-        with open(omero_json) as rf:
+        with omero_json.open() as rf:
             loaded = json.load(rf)
         omero_channels = loaded["channels"]
     except (FileNotFoundError, JSONDecodeError, KeyError):
         print(f"Invalid input file: cannot parse {omero_json}")
         return
 
-    with open(author_json, "w") as wf:
+    with author_json.open("w") as wf:
         json.dump(
             {
                 "in_file": "",
@@ -84,13 +85,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "omero_json",
         metavar="omero_json",
-        type=pathlib.Path,
+        type=Path,
         help="Input path to exported omero channels",
     )
     parser.add_argument(
         "author_json",
         metavar="author_json",
-        type=pathlib.Path,
+        type=Path,
         help="Output Minerva Author save file with channels from omero",
     )
     args = parser.parse_args()
