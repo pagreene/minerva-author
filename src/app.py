@@ -1246,7 +1246,7 @@ def api_import(
 
 @app.get("/api/filebrowser", response_model=BrowserResponse)
 @nocache
-def file_browser(path: Optional[str] = None, parent: Optional[str] = None):
+def file_browser(path: Optional[Path] = None, parent: Optional[bool] = False):
     """
     Endpoint which allows browsing the local file system
 
@@ -1257,13 +1257,16 @@ def file_browser(path: Optional[str] = None, parent: Optional[str] = None):
         Contents of the directory specified by path
         (or parent directory, if parent parameter is set)
     """
-    print(path)
-    folder = path
+    print(path, parent)
+    folder = path.absolute()
     orig_folder = folder
-    if folder is None or folder == "":
+    if folder is None:
         folder = Path.home()
-    elif parent == "true":
-        folder = Path(folder).parent
+    elif parent:
+        print("hi")
+        folder = folder.parent
+
+    print(folder)
 
     if not folder.exists():
         raise HTTPFileNotFoundException(folder)
@@ -1273,7 +1276,7 @@ def file_browser(path: Optional[str] = None, parent: Optional[str] = None):
     # Windows: When navigating back from drive root
     # we have to show a list of available drives
     is_win_dir = os.name == "nt" and folder is not None
-    if is_win_dir and str(orig_folder) == str(folder) and parent == "true":
+    if is_win_dir and str(orig_folder) == str(folder) and parent:
         match = re.search("[A-Za-z]:\\\\$", str(folder))  # C:\ or D:\ etc.
         if match:
             drives = _get_drives_win()
@@ -1287,12 +1290,12 @@ def file_browser(path: Optional[str] = None, parent: Optional[str] = None):
             return response
 
     # Return a list of folders and files within the requested folder
-    for os_stat_result in os.scandir(folder):
+    for os_stat_result in folder.iterdir():
         try:
             is_directory = os_stat_result.is_dir()
             new_entry = {
                 "name": os_stat_result.name,
-                "path": os_stat_result.path,
+                "path": str(os_stat_result),
                 "isDir": is_directory,
             }
 
