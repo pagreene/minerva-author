@@ -13,7 +13,6 @@ import json
 import logging
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from distutils import file_util
 from distutils.errors import DistutilsFileError
 from functools import update_wrapper, wraps
@@ -31,9 +30,15 @@ from pydantic import BaseModel
 # Web App tools
 import webbrowser
 import uvicorn
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    StreamingResponse,
+    RedirectResponse,
+    JSONResponse,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 
@@ -285,7 +290,7 @@ def nocache(view: Callable):
     @wraps(view)
     def no_cache(*args, **kwargs):
         response = view(*args, **kwargs)
-        response.headers["Last-Modified"] = datetime.now()
+        response.headers["Last-Modified"] = str(time.time())
         response.headers[
             "Cache-Control"
         ] = "no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0"
@@ -392,16 +397,22 @@ def reload_all_mask_state_subsets(masks):
     return masks
 
 
-@app.get("/", response_model=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 @nocache
-def root():
+def root(request: Request):
     """
     Serves the minerva-author web UI
     """
-    return templates.TemplateResponse("index.html", {})
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.get("/story/{session}/{file_path:path}", response_model=FileResponse)
+@app.get("/image/{img_path:path}")
+@app.get("/images/{img_path:path}")
+def get_image(img_path):
+    return RedirectResponse(url=f"/static/image/{img_path}")
+
+
+@app.get("/story/{session}/{file_path:path}", response_class=FileResponse)
 @nocache
 def out_story(session: str, file_path: str):
     """
@@ -494,7 +505,7 @@ def mask_subsets(key: str):
     }
 
 
-@app.get("/api/u32/{key}/{level}_{x}_{y}.png", response_model=StreamingResponse)
+@app.get("/api/u32/{key}/{level}_{x}_{y}.png", response_class=StreamingResponse)
 @nocache
 def u32_image(key: str, level: int, x: int, y: int):
     """
@@ -524,7 +535,7 @@ def u32_image(key: str, level: int, x: int, y: int):
 
 
 @app.get(
-    "/api/u16/{key}/{channel}/{level}_{x}_{y}.png", response_model=StreamingResponse
+    "/api/u16/{key}/{channel}/{level}_{x}_{y}.png", response_class=StreamingResponse
 )
 @nocache
 def u16_image(key: str, channel: int, level: int, x: int, y: int):
@@ -1209,33 +1220,33 @@ def api_import(
         logger.error(error_message)
         raise HTTPFileNotFoundException(input_image_file)
 
-    return {
-        "loaded": True,
-        "channels": labels,
-        "out_name": out_name,
-        "root_dir": str(root_dir),
-        "session": uuid.uuid4().hex,
-        "output_save_file": str(out_dat),
-        "marker_csv_file": str(csv_file),
-        "input_image_file": str(input_image_file),
-        "waypoints": response.get("waypoints", []),
-        "sample_info": response.get(
+    return ImportResponse(
+        loaded=True,
+        channels=labels,
+        out_name=out_name,
+        root_dir=str(root_dir),
+        session=uuid.uuid4().hex,
+        output_save_file=str(out_dat),
+        marker_csv_file=str(csv_file),
+        input_image_file=str(input_image_file),
+        waypoints=response.get("waypoints", []),
+        sample_info=response.get(
             "sample_info", {"rotation": 0, "name": "", "text": ""}
         ),
-        "masks": response.get("masks", []),
-        "groups": response.get("groups", []),
-        "tilesize": response.get("tilesize", 1024),
-        "maxLevel": response.get("maxLevel", 1),
-        "height": response.get("height", 1024),
-        "width": response.get("width", 1024),
-        "warning": opener.warning if opener else "",
-        "rgba": opener.is_rgba() if opener else False,
-    }
+        masks=response.get("masks", []),
+        groups=response.get("groups", []),
+        tilesize=response.get("tilesize", 1024),
+        maxLevel=response.get("maxLevel", 1),
+        height=response.get("height", 1024),
+        width=response.get("width", 1024),
+        warning=opener.warning if opener else "",
+        rgba=opener.is_rgba() if opener else False,
+    )
 
 
 @app.get("/api/filebrowser", response_model=BrowserResponse)
 @nocache
-def file_browser(path: str, parent: str):
+def file_browser(path: Optional[str] = None, parent: Optional[str] = None):
     """
     Endpoint which allows browsing the local file system
 
@@ -1246,6 +1257,7 @@ def file_browser(path: str, parent: str):
         Contents of the directory specified by path
         (or parent directory, if parent parameter is set)
     """
+    print(path)
     folder = path
     orig_folder = folder
     if folder is None or folder == "":
@@ -1301,7 +1313,7 @@ def file_browser(path: str, parent: str):
         except PermissionError:
             pass
 
-    return response
+    return JSONResponse(response)
 
 
 def _get_drives_win():
@@ -1357,4 +1369,4 @@ if __name__ == "__main__":
     atexit.register(close_masks)
     atexit.register(close_import_pool)
 
-    uvicorn.run("app.py:app", reload="--dev" in sys.argv, port=PORT)
+    uvicorn.run("app:app", reload="--dev" in sys.argv, port=PORT)
