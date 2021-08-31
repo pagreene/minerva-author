@@ -1099,19 +1099,20 @@ def is_new_autosave(saved, autosaved):
         return False
 
 
+class ImportData(BaseModel):
+    filepath: str
+    csvpath: str
+    dataset: str
+    autosave_logic: str
+
+
 @app.post("/api/import", response_model=ImportResponse)
-@nocache
-def api_import(
-    filepath: str = Form(...),
-    dataset: str = Form(...),
-    csvpath: Optional[str] = Form(...),
-    autosave_logic: Optional[str] = Form(default="skip"),
-):
+def api_import(import_data: ImportData):
     response = {}
     chan_label = {}
     default_out_name = "out"
-    input_file = Path(filepath)
-    input_image_file = Path(filepath)
+    input_file = Path(import_data.filepath)
+    input_image_file = Path(import_data.filepath)
     loading_saved_file = input_file.suffix in [".dat", ".json"]
     root_dir = get_current_dir()
 
@@ -1121,7 +1122,7 @@ def api_import(
     if loading_saved_file:
         default_out_name = extract_story_json_stem(input_file)
         # autosave_logic should be "ask", "skip", or "load"
-        autosave_error = autosave_logic == "ask"
+        autosave_error = import_data.autosave_logic == "ask"
 
         (saved, autosaved) = load_saved_file(input_file)
         root_dir = input_file.parent
@@ -1133,13 +1134,13 @@ def api_import(
                     status_code=400, detail="AUTO ASK ERR: Autosave Error."
                 )
             # We will load a new autosave file
-            elif autosave_logic == "load":
+            elif import_data.autosave_logic == "load":
                 saved = copy_saved_states(autosaved, saved)
 
         input_image_file = Path(saved["in_file"])
 
-        if csvpath:
-            csv_file = Path(csvpath)
+        if import_data.csvpath:
+            csv_file = Path(import_data.csvpath)
             if not csv_file.exists():
                 raise HTTPFileNotFoundException(f'marker csv file "{csv_file}"')
         else:
@@ -1159,9 +1160,9 @@ def api_import(
             for chan in group["channels"]:
                 chan_label[str(chan["id"])] = chan["label"]
     else:
-        csv_file = Path(csvpath)
+        csv_file = Path(import_data.csvpath)
 
-    out_name = label_to_dir(dataset, empty=default_out_name)
+    out_name = label_to_dir(import_data.dataset, empty=default_out_name)
     if out_name == "":
         out_name = default_out_name
 
@@ -1188,7 +1189,7 @@ def api_import(
     try:
         logger.info("Opening file: ", str(input_image_file))
 
-        (invalid, opener) = return_image_opener(str(input_image_file))
+        (invalid, opener) = return_image_opener(input_image_file)
         if invalid or not opener:
             raise HTTPFileNotFoundException(input_image_file)
 
