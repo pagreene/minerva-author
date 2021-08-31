@@ -168,7 +168,7 @@ mask_lock = multiprocessing.Lock()
 app = FastAPI(title="Minerva Author")
 app.mount("/static", StaticFiles(directory=resource_path("static")), name="static")
 
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=resource_path("templates"))
 
 # Source: https://fastapi.tiangolo.com/tutorial/cors/
 if "MINERVA_AUTHOR_CORS_ORIGINS" in os.environ:
@@ -403,7 +403,13 @@ def root(request: Request):
     """
     Serves the minerva-author web UI
     """
-    return templates.TemplateResponse("index.html", {"request": request})
+    if os.environ.get("MINERVA_AUTHOR_DEBUG", "0") == "1":
+        ui_src = "http://localhost:8487/bundle.js"
+    else:
+        ui_src = "https://cdn.jsdelivr.net/npm/minerva-author-ui@1.0.2/build/bundle.29ba4799d2236e2efe2a.js"
+    return templates.TemplateResponse(
+        "index.html", {"request": request, "ui_src": ui_src}
+    )
 
 
 @app.get("/image/{img_path:path}")
