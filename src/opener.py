@@ -141,7 +141,7 @@ class TiffOpener(Opener):
         self.ome_version = self._get_ome_version(io)
         if self.ome_version == 5:
             io = TiffFile(self.path, is_ome=False)
-        self.group = zarr.open(self.io.series[0].aszarr())
+        self.group = zarr.open(io.series[0].aszarr())
         # Treat non-pyramids as groups of one array
         if isinstance(self.group, zarr.core.Array):
             root = zarr.group()
