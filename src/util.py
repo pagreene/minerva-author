@@ -30,6 +30,6 @@ def resource_path(relative_path):
             # PyInstaller creates a temp folder at _MEIPASS
             base_path = sys._MEIPASS
         except AttributeError:
-            base_path = Path(".").absolute()
+            base_path = Path(__file__).absolute().parent
 
     return base_path / relative_path
